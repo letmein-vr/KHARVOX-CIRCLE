@@ -196,7 +196,7 @@ sealed class Launcher : Window {
         layout.Children.Add(banner);
         var pathRow=new Grid(); pathRow.ColumnDefinitions.Add(new ColumnDefinition {Width=new GridLength(92)}); pathRow.ColumnDefinitions.Add(new ColumnDefinition()); pathRow.ColumnDefinitions.Add(new ColumnDefinition {Width=new GridLength(108)});
         pathRow.Children.Add(new TextBlock {Text="Game folder",VerticalAlignment=VerticalAlignment.Center,Foreground=muted});
-        gamePath=new ComboBox {IsEditable=true,Text=Value("game_directory","D:\\Games\\Jones").ToString(),Margin=new Thickness(0,5,12,5),VerticalContentAlignment=VerticalAlignment.Center,ToolTip="Select an installed GOG/Steam copy or browse to another installation. Every executable is checked against its own build profile."};
+        gamePath=new ComboBox {IsEditable=true,Text=Value("game_directory","D:\\Games\\Jones").ToString(),Margin=new Thickness(0,5,12,5),VerticalContentAlignment=VerticalAlignment.Center,ToolTip="Select an installed GOG/Steam/Game Pass copy or browse to another installation (Game Pass: the folder that holds MicrosoftGame.config). Every executable is checked against its own build profile."};
         var installations=InstalledGames(gamePath.Text).ToArray();
         foreach(var path in installations)gamePath.Items.Add(path);
         if(installations.Length>0&&!installations.Contains(gamePath.Text,StringComparer.OrdinalIgnoreCase))gamePath.Text=installations[0];
@@ -393,6 +393,21 @@ sealed class Launcher : Window {
         try {File.WriteAllText(temp,json.Serialize(next),new UTF8Encoding(false));if(File.Exists(SettingsPath))File.Replace(temp,SettingsPath,SettingsPath+".bak");else File.Move(temp,SettingsPath);}finally{if(File.Exists(temp))File.Delete(temp);}
         settings=next;savedSelection=SelectionSnapshot();status.Text="Settings saved. Changes apply on next launch.";
     }
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string name,uint access,uint share,IntPtr security,uint disposition,uint flags,IntPtr template);
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle file,System.Text.StringBuilder path,uint size,uint flags);
+    // Final folder behind every junction, or the path itself when it cannot be resolved.
+    static string StoreInstallFolder(string path) {
+        if(String.IsNullOrWhiteSpace(path))return path;
+        using(var handle=CreateFileW(path,0,7,IntPtr.Zero,3,0x02000000,IntPtr.Zero)) { // no data access, share all, OPEN_EXISTING, BACKUP_SEMANTICS
+            if(handle.IsInvalid)return path;
+            var buffer=new System.Text.StringBuilder(32768);
+            var n=GetFinalPathNameByHandleW(handle,buffer,(uint)buffer.Capacity,0);
+            if(n==0||n>=buffer.Capacity)return path;
+            var resolved=buffer.ToString();
+            if(resolved.StartsWith(@"\\?\UNC\"))return @"\\"+resolved.Substring(8);
+            return resolved.StartsWith(@"\\?\")?resolved.Substring(4):resolved;
+        }
+    }
     static IEnumerable<string> InstalledGames(string selected) {
         var games=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var steamGames=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -415,6 +430,15 @@ sealed class Launcher : Window {
                 }
             }catch(System.Security.SecurityException){}catch(UnauthorizedAccessException){}catch(IOException){}
         }
+        // Microsoft Store / Game Pass registers the package root, which reaches the install folder through junctions.
+        try {
+            using(var packages=Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages")) {
+                if(packages!=null)foreach(var name in packages.GetSubKeyNames()) {
+                    if(!name.StartsWith("BethesdaSoftworks.ProjectRelic_",StringComparison.OrdinalIgnoreCase))continue;
+                    using(var entry=packages.OpenSubKey(name))if(entry!=null)addGame(StoreInstallFolder(Convert.ToString(entry.GetValue("PackageRootFolder"))));
+                }
+            }
+        }catch(System.Security.SecurityException){}catch(UnauthorizedAccessException){}catch(IOException){}
         foreach(var key in new[]{@"HKEY_CURRENT_USER\Software\Valve\Steam",@"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Valve\Steam"}) {
             var value=Microsoft.Win32.Registry.GetValue(key,key.StartsWith("HKEY_CURRENT_USER")?"SteamPath":"InstallPath",null) as string;
             if(!String.IsNullOrWhiteSpace(value))steamRoots.Add(value);
@@ -443,7 +467,7 @@ sealed class Launcher : Window {
         }
         return games.OrderByDescending(p=>steamGames.Contains(p)).ThenBy(p=>p,StringComparer.OrdinalIgnoreCase);
     }
-    void Browse() {var dialog=new Microsoft.Win32.OpenFileDialog {Title="Select TheGreatCircle.exe (GOG / Steam / other store)",Filter="Indiana Jones executable|TheGreatCircle.exe",CheckFileExists=true};if(Directory.Exists(gamePath.Text))dialog.InitialDirectory=gamePath.Text;if(dialog.ShowDialog(this)==true){gamePath.Text=Path.GetDirectoryName(dialog.FileName);if(!gamePath.Items.Contains(gamePath.Text))gamePath.Items.Add(gamePath.Text);}}
+    void Browse() {var dialog=new Microsoft.Win32.OpenFileDialog {Title="Select TheGreatCircle.exe (GOG / Steam / Game Pass)",Filter="Indiana Jones executable|TheGreatCircle.exe",CheckFileExists=true};if(Directory.Exists(gamePath.Text))dialog.InitialDirectory=gamePath.Text;if(dialog.ShowDialog(this)==true){gamePath.Text=Path.GetDirectoryName(dialog.FileName);if(!gamePath.Items.Contains(gamePath.Text))gamePath.Items.Add(gamePath.Text);}}
     Dictionary<string,object> LaunchParameters(bool check) {
         var mode=Convert.ToString(settings["launch_mode"]);
         var args=new Dictionary<string,object>{{"PackageRoot",root},{"SettingsFile",SettingsPath},{"GameDirectory",Convert.ToString(settings["game_directory"])},{"Mode",check?"diagnostic":mode=="stereo"||mode=="diagnostic-aer"||mode=="experimental-stereo"?"cinema":mode}};

@@ -8,6 +8,8 @@ try {$hash=([BitConverter]::ToString($hasher.ComputeHash([IO.File]::ReadAllBytes
 if($header -notmatch "(?i)Catalog SHA256: $hash") {throw 'Build catalog changed: run tools/generate-build-profiles.py before building.'}
 $registered=@{}
 $steam=@{}
+$gamepass=@{}
+$gamepassSize=[Convert]::ToInt64((@($catalog.profiles | Where-Object id -eq 'GamePass170')[0].imageSize).Substring(2),16)
 foreach($entry in $catalog.addresses.PSObject.Properties){
     $key=[Convert]::ToInt64($entry.Name.Substring(2),16)
     $target=[Convert]::ToInt64($entry.Value.steam.Substring(2),16)
@@ -15,6 +17,15 @@ foreach($entry in $catalog.addresses.PSObject.Properties){
     if($steam.ContainsKey($target)){throw "Duplicate Steam address: $($entry.Value.steam)"}
     $registered[$key]=$true; $steam[$target]=$true
     foreach($field in @('gogBytes','steamBytes')){if($entry.Value.$field -notmatch '^[a-fA-F0-9]{64}$'){throw "Missing fingerprint: $($entry.Name) $field"}}
+    # Game Pass: null = not present in that build. Every hook site needs an address and its own fingerprint.
+    if($null -eq $entry.Value.gamepass){if($entry.Value.code){throw "Missing Game Pass address: $($entry.Name)"}}
+    else{
+        $gp=[Convert]::ToInt64($entry.Value.gamepass.Substring(2),16)
+        if($gp -lt 0x400000 -or $gp -ge $gamepassSize){throw "Out-of-image Game Pass address: $($entry.Name)"}
+        if($gamepass.ContainsKey($gp)){throw "Duplicate Game Pass address: $($entry.Value.gamepass)"}
+        $gamepass[$gp]=$true
+        if($entry.Value.code -and $entry.Value.gamepassBytes -notmatch '^[a-fA-F0-9]{64}$'){throw "Missing fingerprint: $($entry.Name) gamepassBytes"}
+    }
 }
 $files=@(Get-ChildItem -LiteralPath (Join-Path $root 'src/motor') -File | Where-Object {$_.Extension -in '.cpp','.hpp','.inl' -and $_.Name -notlike '*_test.cpp' -and $_.Name -notlike 'build_*'})
 $files+=Get-Item -LiteralPath (Join-Path $root 'src/circlevr/src/vkcore/ui_engine.cpp')
@@ -31,4 +42,4 @@ foreach($file in $files){
         if($line -match '\b(?:base|base_|g_base)\s*\+\s*0x[0-9a-fA-F]{6,}') {throw "Raw executable address in $($file.Name): use build::rva()."}
     }
 }
-Write-Output "Build catalog synchronized; $($registered.Count) addresses covered for GOG and Steam."
+Write-Output "Build catalog synchronized; $($registered.Count) addresses covered for GOG and Steam; $($gamepass.Count) for Game Pass."

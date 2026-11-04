@@ -1012,9 +1012,11 @@ bool completeMonoFrame(void* info,std::uint64_t token,std::uint32_t renderFrame)
 bool installObservation(std::string& error) {
     static std::once_flag once;static bool ok=false;static std::string why;
     std::call_once(once,[]{
-        NativeStateObserver observer;if(!observer.sample().nativeStateValid){why=observer.validation();return;}
+        NativeStateObserver observer;if(!observer.sample().nativeStateValid){
+            if(!build::supported())circlevr::vkcore::logf("motor-build: unrecognized executable; checked SHA-256 %s",build::checkedHash()[0]?build::checkedHash():"(PE timestamp/size match no profile)");
+            why=observer.validation();return;}
         base=reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-        circlevr::vkcore::logf("motor-build: exact executable profile %s; separate address table and instruction fingerprints",build::current()->name);
+        circlevr::vkcore::logf("motor-build: exact executable profile %s (SHA-256 %s); separate address table and instruction fingerprints",build::current()->name,build::checkedHash());
         if(field<std::uintptr_t>(base+build::rva(0x4a717f0))!=base+build::rva(0x369fea0) || field<std::uintptr_t>(base+build::rva(0x369fef8))!=base+build::rva(0xc978a0) ||
            field<std::uintptr_t>(base+build::rva(0x3ea09e0))!=base+build::rva(0xc98240)){why="Motor render-system/vtable/frame-end slot mismatch";return;}
         if(!build::matches(0xd9f920,"\x40\x55\x53\x41\x55\x41\x57",7)){why="Native sparse model upload fingerprint mismatch";return;}

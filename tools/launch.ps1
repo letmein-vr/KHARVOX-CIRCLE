@@ -52,6 +52,78 @@ param(
     [string]$PackageRoot
 )
 $ErrorActionPreference = 'Stop'
+# Microsoft Store / Game Pass installs. The folder is a registered package whose executable is
+# encrypted on disk: started directly it only relaunches itself through GameLaunchHelper, without
+# this process's environment or arguments. Package activation forwards arguments, and the game
+# receives the user environment from the registry, so the launch environment is placed there for
+# the moment of activation and the previous values are restored as soon as the game process exists.
+function Resolve-CircleStorePackage([string]$GameDirectory) {
+    $manifest = Join-Path $GameDirectory 'appxmanifest.xml'
+    if (!(Test-Path -LiteralPath $manifest -PathType Leaf)) { throw 'Microsoft Store install without appxmanifest.xml.' }
+    $identity = ([xml](Get-Content -LiteralPath $manifest -Raw)).Package.Identity
+    $package = @(Get-AppxPackage -Name $identity.Name -ErrorAction SilentlyContinue | Where-Object { [string]$_.Version -eq $identity.Version })
+    if ($package.Count -ne 1) { throw "Microsoft Store package $($identity.Name) $($identity.Version) is not registered for this user. Install or repair it in the Xbox app." }
+    # The registered location reaches the install folder through junctions (WindowsApps -> drive WindowsApps -> folder).
+    $wanted = [IO.Path]::GetFullPath($GameDirectory).TrimEnd('\'); $at = $package[0].InstallLocation
+    for ($i = 0; $i -lt 4 -and $at; $i++) {
+        if ([IO.Path]::GetFullPath($at).TrimEnd('\') -ieq $wanted) { return $package[0] }
+        $item = Get-Item -LiteralPath $at -ErrorAction SilentlyContinue
+        $at = if ($item -and $item.LinkType -eq 'Junction') { @($item.Target)[0] } else { $null }
+    }
+    throw "Microsoft Store package $($identity.Name) is registered at $($package[0].InstallLocation), not at $GameDirectory."
+}
+function Start-CircleStorePackage($Package, [string]$AppId, [string]$Arguments, [Collections.Specialized.StringDictionary]$Environment) {
+    if (!('CircleStoreActivation' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+[ComImport, Guid("2e941141-7f97-4756-ba1d-9decde894a3d"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface ICircleApplicationActivationManager { int ActivateApplication(string appUserModelId, string arguments, int options, out uint processId); }
+[ComImport, Guid("45BA127D-10A8-46EA-8AB7-56EA9078943C")] class CircleApplicationActivationManager {}
+public static class CircleStoreActivation {
+    public static uint Activate(string appUserModelId, string arguments) {
+        var manager = (ICircleApplicationActivationManager)new CircleApplicationActivationManager(); uint pid;
+        int hr = manager.ActivateApplication(appUserModelId, arguments, 0, out pid);
+        if (hr != 0) throw new COMException("Package activation failed for " + appUserModelId, hr);
+        return pid;
+    }
+}
+'@
+    }
+    $prefix = '^(CIRCLE_|KHARVOX_CIRCLE_|ARGENT_)'
+    $wanted = [Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in @($Environment.Keys | Sort-Object)) { if ($name -match $prefix -or $name -in @('XR_RUNTIME_JSON','VK_ADD_IMPLICIT_LAYER_PATH')) { $wanted[$name.ToUpperInvariant()] = $Environment[$name] } }
+    $restorePath = Join-Path $env:LOCALAPPDATA 'KHARVOX CIRCLE\store-launch-environment.json'
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+    try {
+        # A launch interrupted before its restore left its snapshot behind: put those values back first.
+        if (Test-Path -LiteralPath $restorePath) { Restore-CircleUserEnvironment $key (Get-Content -LiteralPath $restorePath -Raw | ConvertFrom-Json); Remove-Item -LiteralPath $restorePath }
+        $touched = @($key.GetValueNames() | Where-Object { $_ -match $prefix }) + @($wanted.Keys) | Sort-Object -Unique
+        $snapshot = [ordered]@{}
+        foreach ($name in $touched) { $snapshot[$name] = if ($null -ne $key.GetValue($name, $null, 'DoNotExpandEnvironmentNames')) { [ordered]@{ kind = [string]$key.GetValueKind($name); value = [string]$key.GetValue($name, $null, 'DoNotExpandEnvironmentNames') } } else { $null } }
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $restorePath) | Out-Null
+        [pscustomobject]$snapshot | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $restorePath -Encoding utf8
+        try {
+            foreach ($name in $touched) { if ($wanted.Contains($name)) { $key.SetValue($name, [string]$wanted[$name], [Microsoft.Win32.RegistryValueKind]::String) } elseif ($null -ne $snapshot[$name]) { $key.DeleteValue($name) } }
+            $helper = [CircleStoreActivation]::Activate("$($Package.PackageFamilyName)!$AppId", $Arguments.Trim())
+            $deadline = [DateTime]::UtcNow.AddSeconds(60); $game = $null
+            while (!$game -and [DateTime]::UtcNow -lt $deadline) {
+                $game = @(Get-CimInstance Win32_Process -Filter "Name='TheGreatCircle.exe' AND ParentProcessId=$helper" -ErrorAction SilentlyContinue)[0]
+                if (!$game) { Start-Sleep -Milliseconds 200 }
+            }
+            if (!$game) { throw 'The Microsoft Store package started but TheGreatCircle.exe did not appear within 60 seconds.' }
+            return Get-Process -Id $game.ProcessId
+        } finally {
+            Restore-CircleUserEnvironment $key ([pscustomobject]$snapshot)
+            Remove-Item -LiteralPath $restorePath -ErrorAction SilentlyContinue
+        }
+    } finally { $key.Close() }
+}
+function Restore-CircleUserEnvironment([Microsoft.Win32.RegistryKey]$Key, $Snapshot) {
+    foreach ($entry in $Snapshot.PSObject.Properties) {
+        if ($null -eq $entry.Value) { if ($null -ne $Key.GetValue($entry.Name)) { $Key.DeleteValue($entry.Name) } }
+        else { $Key.SetValue($entry.Name, [string]$entry.Value.value, [Microsoft.Win32.RegistryValueKind]$entry.Value.kind) }
+    }
+}
 $root = if($PackageRoot){[IO.Path]::GetFullPath($PackageRoot)}else{Split-Path -Parent $PSScriptRoot}
 $settings=$null
 if (!$SettingsFile) {
@@ -152,13 +224,24 @@ if ($gogInfo) {
     $task = (Get-Content -LiteralPath $gogInfo.FullName -Raw | ConvertFrom-Json).playTasks | Where-Object isPrimary | Select-Object -First 1
     if ($task -and $task.path -eq [IO.Path]::GetFileName($game)) { $arguments = $task.arguments }
 }
-$gameVersion = (Get-Item -LiteralPath $game).VersionInfo.FileVersion
-$gameHash = (Get-FileHash -LiteralPath $game -Algorithm SHA256).Hash
 $catalog=if($script:CircleEmbeddedBuildCatalog){$script:CircleEmbeddedBuildCatalog | ConvertFrom-Json}else{Get-Content -LiteralPath (Join-Path $root 'profiles/motor-builds.json') -Raw | ConvertFrom-Json}
-$buildProfile=@($catalog.profiles | Where-Object { $_.version -eq $gameVersion -and $_.sha256 -eq $gameHash })
+$storePackage=$null
+if (Test-Path -LiteralPath (Join-Path $GameDirectory 'MicrosoftGame.config') -PathType Leaf) {
+    # The encrypted executable's hash and version resource cannot be read: the registered package
+    # identity selects the profile, and the native layer checks the exact code image in memory
+    # before enabling any hook (an unmatched build stays an ordinary game).
+    $storePackage=Resolve-CircleStorePackage -GameDirectory $GameDirectory
+    $gameVersion=$null; $gameHash=$null
+    $buildProfile=@($catalog.profiles | Where-Object { $_.store -eq 'gamepass' -and $_.packageName -eq $storePackage.Name -and $_.packageVersion -eq [string]$storePackage.Version })
+    if($buildProfile.Count -eq 0){Write-Warning "Microsoft Store package version $($storePackage.Version) has no validated profile."}
+} else {
+    $gameVersion = (Get-Item -LiteralPath $game).VersionInfo.FileVersion
+    $gameHash = (Get-FileHash -LiteralPath $game -Algorithm SHA256).Hash
+    $buildProfile=@($catalog.profiles | Where-Object { $_.identity -ne 'code-image' -and $_.version -eq $gameVersion -and $_.sha256 -eq $gameHash })
+}
 $knownBuild=$buildProfile.Count -eq 1
 $buildProfile=$(if($knownBuild){$buildProfile[0]}else{$null})
-if(($ExperimentalStereo -or $Stereo -or $DiagnosticAER) -and (!$knownBuild -or $Mode -ne 'cinema')) {throw 'Stereo requires an explicitly verified Motor build (GOG or Steam) and cinema transport mode. Unknown updates and Microsoft Store builds need their own validated profile.'}
+if(($ExperimentalStereo -or $Stereo -or $DiagnosticAER) -and (!$knownBuild -or $Mode -ne 'cinema')) {throw 'Stereo requires an explicitly verified Motor build (GOG, Steam or Game Pass) and cinema transport mode. Unknown updates need their own validated profile.'}
 if($knownBuild){Write-Host "Verified game build: $($buildProfile.name)"}
 if($knownBuild -and $Mode -eq 'cinema'){
     $arguments += ' +r_motionblur 0 +r_chromaticAberration 0'
@@ -477,7 +560,11 @@ try {
         Invoke-CircleVrIntro -Root $root -SettingsFile $SettingsFile -RuntimeJson $start.EnvironmentVariables['XR_RUNTIME_JSON'] -EnableLogging $EnableLogging -CancelEvent $cancelEvent
     }
     if($cancelEvent -and $cancelEvent.WaitOne(0)){throw 'Game launch cancelled.'}
-    $process = [Diagnostics.Process]::Start($start)
+    if($storePackage){
+        # Unrecognized package versions launch too (mod features stay off natively), like unknown file builds.
+        $appId=if($knownBuild){[string]$buildProfile.appId}else{'Game'}
+        $process = Start-CircleStorePackage -Package $storePackage -AppId $appId -Arguments $arguments -Environment $start.EnvironmentVariables
+    } else { $process = [Diagnostics.Process]::Start($start) }
 } finally {if($cancelEvent){$cancelEvent.Dispose()}}
 $record.pid = $process.Id
 $record.status = 'launched'
